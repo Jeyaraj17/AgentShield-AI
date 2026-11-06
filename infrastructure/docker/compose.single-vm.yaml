@@ -1,0 +1,243 @@
+# Single-VM deployment overlay for compose.yaml.
+# Requires Docker Compose >= 2.24.4. Only edge publishes host ports.
+# This is a constrained single-host deployment profile, not an HA production platform.
+x-single-vm-app-env: &single-vm-app-env
+  SPRING_PROFILES_ACTIVE: production
+  SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+  SPRING_RABBITMQ_SSL_ENABLED: "false"
+  RABBITMQ_ADDRESSES: rabbitmq:5672
+  RABBITMQ_VIRTUAL_HOST: /agentshield
+  DEV_TLS_TRUSTSTORE_PASSWORD: ${DEV_TLS_TRUSTSTORE_PASSWORD:?Set DEV_TLS_TRUSTSTORE_PASSWORD}
+  JAVA_TOOL_OPTIONS: -Xms128m -Xmx384m
+
+  # Each RabbitMQ application account is provisioned with access only to its own queue/DLQ.
+
+services:
+  tls-init:
+    image: ${TLS_INIT_IMAGE:?Set pinned TLS_INIT_IMAGE digest}
+
+  mysql:
+    image: ${MYSQL_IMAGE:?Set pinned MYSQL_IMAGE digest}
+    ports: !override []
+    command:
+      - --require-secure-transport=ON
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=80
+    mem_limit: 1g
+
+  rabbitmq:
+    image: ${RABBITMQ_IMAGE:?Set pinned RABBITMQ_IMAGE digest}
+    ports: !override []
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_ADMIN_USERNAME:?Set RABBITMQ_ADMIN_USERNAME}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_ADMIN_PASSWORD:?Set RABBITMQ_ADMIN_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: /agentshield
+    mem_limit: 512m
+
+  rabbitmq-provision:
+    image: ${RABBITMQ_PROVISION_IMAGE:?Set pinned RABBITMQ_PROVISION_IMAGE digest}
+    restart: "no"
+    command: ["python", "/scripts/provision-rabbitmq.py"]
+    environment:
+      RABBITMQ_ADMIN_USERNAME: ${RABBITMQ_ADMIN_USERNAME:?Set RABBITMQ_ADMIN_USERNAME}
+      RABBITMQ_ADMIN_PASSWORD: ${RABBITMQ_ADMIN_PASSWORD:?Set RABBITMQ_ADMIN_PASSWORD}
+      RABBITMQ_VIRTUAL_HOST: /agentshield
+      RABBITMQ_IDENTITY_USERNAME: ${RABBITMQ_IDENTITY_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_IDENTITY_PASSWORD: ${RABBITMQ_IDENTITY_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_AGENT_USERNAME: ${RABBITMQ_AGENT_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_AGENT_PASSWORD: ${RABBITMQ_AGENT_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_POLICY_USERNAME: ${RABBITMQ_POLICY_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_POLICY_PASSWORD: ${RABBITMQ_POLICY_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_AI_ANALYSIS_USERNAME: ${RABBITMQ_AI_ANALYSIS_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_AI_ANALYSIS_PASSWORD: ${RABBITMQ_AI_ANALYSIS_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_RUNTIME_USERNAME: ${RABBITMQ_RUNTIME_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_RUNTIME_PASSWORD: ${RABBITMQ_RUNTIME_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_AUDIT_USERNAME: ${RABBITMQ_AUDIT_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_AUDIT_PASSWORD: ${RABBITMQ_AUDIT_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_NOTIFICATION_USERNAME: ${RABBITMQ_NOTIFICATION_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_NOTIFICATION_PASSWORD: ${RABBITMQ_NOTIFICATION_PASSWORD:?Set per-service RabbitMQ credentials}
+      RABBITMQ_GATEWAY_USERNAME: ${RABBITMQ_GATEWAY_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_GATEWAY_PASSWORD: ${RABBITMQ_GATEWAY_PASSWORD:?Set per-service RabbitMQ credentials}
+    volumes:
+      - ./provision-rabbitmq.py:/scripts/provision-rabbitmq.py:ro
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+    networks: [agentshield]
+    mem_limit: 64m
+
+  mock-protected-tool:
+    profiles: [manual-mock-only]
+
+  identity-service:
+    image: ${IMAGE_NAMESPACE:-agentshield}/identity-service:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      SERVER_SERVLET_SESSION_COOKIE_SECURE: "true"
+      AUTH_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      PUBLIC_GATEWAY_URL: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AUTH_SPA_REDIRECT_URI: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}/auth/callback
+      AUTH_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_ONBOARDING_ENABLED: "false"
+      DB_URL: jdbc:mysql://mysql:3306/agentshield_identity?sslMode=REQUIRED&serverTimezone=UTC
+      RABBITMQ_USERNAME: ${RABBITMQ_IDENTITY_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_IDENTITY_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  agent-management-service:
+    image: ${IMAGE_NAMESPACE:-agentshield}/agent-management-service:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AGENT_DB_URL: jdbc:mysql://mysql:3306/agent_management?sslMode=REQUIRED&serverTimezone=UTC
+      AGENT_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${RABBITMQ_AGENT_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_AGENT_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  policy-engine:
+    image: ${IMAGE_NAMESPACE:-agentshield}/policy-engine:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      POLICY_DB_URL: jdbc:mysql://mysql:3306/policy_engine?sslMode=REQUIRED&serverTimezone=UTC
+      POLICY_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${RABBITMQ_POLICY_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_POLICY_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  ai-analysis-service:
+    image: ${IMAGE_NAMESPACE:-agentshield}/ai-analysis-service:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AI_ANALYSIS_DB_URL: jdbc:mysql://mysql:3306/ai_analysis?sslMode=REQUIRED&serverTimezone=UTC
+      AI_ANALYSIS_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AI_LLM_ENABLED: ${AI_LLM_ENABLED:-false}
+      AI_LLM_PROVIDER: ${AI_LLM_PROVIDER:-none}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RABBITMQ_USERNAME: ${RABBITMQ_AI_ANALYSIS_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_AI_ANALYSIS_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  runtime-security-gateway:
+    image: ${IMAGE_NAMESPACE:-agentshield}/runtime-security-gateway:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RUNTIME_DB_URL: jdbc:mysql://mysql:3306/runtime_security_gateway?sslMode=REQUIRED&serverTimezone=UTC
+      RUNTIME_TOOL_DESTINATIONS: ${RUNTIME_TOOL_DESTINATIONS:?Set reviewed production tool destinations}
+      RABBITMQ_USERNAME: ${RABBITMQ_RUNTIME_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_RUNTIME_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on: !override
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      rabbitmq-provision: { condition: service_completed_successfully }
+      identity-service: { condition: service_healthy }
+      agent-management-service: { condition: service_healthy }
+      policy-engine: { condition: service_healthy }
+      ai-analysis-service: { condition: service_healthy }
+    networks: !override [agentshield, approved-tool-egress]
+    mem_limit: 768m
+
+  audit-service:
+    image: ${IMAGE_NAMESPACE:-agentshield}/audit-service:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AUDIT_DB_URL: jdbc:mysql://mysql:3306/audit_service?sslMode=REQUIRED&serverTimezone=UTC
+      AUDIT_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${RABBITMQ_AUDIT_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_AUDIT_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  notification-service:
+    image: ${IMAGE_NAMESPACE:-agentshield}/notification-service:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      NOTIFICATION_DB_URL: jdbc:mysql://mysql:3306/notification_service?sslMode=REQUIRED&serverTimezone=UTC
+      NOTIFICATION_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${RABBITMQ_NOTIFICATION_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_NOTIFICATION_PASSWORD:?Set per-service RabbitMQ credentials}
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  api-gateway:
+    image: ${IMAGE_NAMESPACE:-agentshield}/api-gateway:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    environment:
+      <<: *single-vm-app-env
+      PUBLIC_GATEWAY_URL: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      GATEWAY_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      GATEWAY_ORGANIZATION_ONBOARDING_ENABLED: "false"
+      RABBITMQ_USERNAME: ${RABBITMQ_GATEWAY_USERNAME:?Set per-service RabbitMQ credentials}
+      RABBITMQ_PASSWORD: ${RABBITMQ_GATEWAY_PASSWORD:?Set per-service RabbitMQ credentials}
+    ports: !override []
+    networks: !override [agentshield, edge-app]
+    depends_on:
+      rabbitmq-provision: { condition: service_completed_successfully }
+    mem_limit: 768m
+
+  frontend:
+    image: ${IMAGE_NAMESPACE:-agentshield}/frontend:${RELEASE_TAG:?Set immutable RELEASE_TAG}
+    build:
+      args:
+        VITE_API_BASE_URL: ""
+        VITE_AUTH_CLIENT_ID: ${AUTH_SPA_CLIENT_ID:-agentshield-react-spa}
+        VITE_AUTH_REDIRECT_URI: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}/auth/callback
+    ports: !override []
+    networks: !override [edge-app]
+    mem_limit: 128m
+
+  edge:
+    image: ${CADDY_IMAGE:?Set pinned CADDY_IMAGE digest}
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      CADDY_EMAIL: ${CADDY_EMAIL:?Set CADDY_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile.single-vm:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      frontend: { condition: service_healthy }
+      api-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [edge-app, public-edge]
+    mem_limit: 128m
+
+networks:
+  agentshield:
+    internal: true
+  edge-app:
+    driver: bridge
+    internal: true
+  public-edge:
+    driver: bridge
+  approved-tool-egress:
+    driver: bridge
+
+volumes:
+  caddy-data:
+  caddy-config:

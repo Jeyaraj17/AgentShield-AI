@@ -1,0 +1,46 @@
+# Java / Maven / Gradle
+*.class
+*.jar
+*.war
+*.ear
+target/
+build/
+.gradle/
+
+# Spring Boot / logs
+*.log
+logs/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.npm/
+
+# React / frontend build output
+dist/
+build/
+.coverage/
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+!.env.production.example
+/backend/identity-service/application-local-secrets.properties
+/infrastructure/docker/certs/
+*.pem
+*.p12
+*.key
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

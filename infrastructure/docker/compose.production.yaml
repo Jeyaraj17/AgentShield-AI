@@ -1,0 +1,295 @@
+# Production overlay for compose.yaml. Requires Docker Compose >= 2.24.4.
+# Only the Caddy edge publishes ports. Database, broker and application ports stay private.
+x-prod-truststore-volume: &prod-truststore-volume
+  type: bind
+  source: ${INTERNAL_TRUSTSTORE_FILE:?Set INTERNAL_TRUSTSTORE_FILE}
+  target: /run/agentshield/identity-truststore.p12
+  read_only: true
+x-prod-ca-volume: &prod-ca-volume
+  type: bind
+  source: ${INTERNAL_CA_FILE:?Set INTERNAL_CA_FILE}
+  target: /run/agentshield/internal-ca.crt
+  read_only: true
+x-prod-service-env: &prod-service-env
+  SPRING_PROFILES_ACTIVE: production
+  DEV_TLS_TRUSTSTORE_PASSWORD: ${INTERNAL_TRUSTSTORE_PASSWORD:?Set INTERNAL_TRUSTSTORE_PASSWORD}
+  RABBITMQ_ADDRESSES: ${RABBITMQ_ADDRESSES:?Set private RABBITMQ_ADDRESSES}
+  RABBITMQ_VIRTUAL_HOST: ${RABBITMQ_VIRTUAL_HOST:?Set RABBITMQ_VIRTUAL_HOST}
+  SPRING_RABBITMQ_SSL_ENABLED: "true"
+
+services:
+  tls-init:
+    profiles: [production-disabled]
+  mysql:
+    profiles: [production-disabled]
+    ports: !override []
+  rabbitmq:
+    profiles: [production-disabled]
+    ports: !override []
+  mock-protected-tool:
+    profiles: [production-disabled]
+  identity-service:
+    environment:
+      <<: *prod-service-env
+      SERVER_SERVLET_SESSION_COOKIE_SECURE: "true"
+      SERVER_SSL_KEY_STORE: file:/run/secrets/identity-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${IDENTITY_TLS_KEYSTORE_PASSWORD:?Set IDENTITY_TLS_KEYSTORE_PASSWORD}
+      IDENTITY_ONBOARDING_ENABLED: "false"
+      AUTH_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      PUBLIC_GATEWAY_URL: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AUTH_SPA_REDIRECT_URI: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}/auth/callback
+      AUTH_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AUTH_SIGNING_PRIVATE_KEY_BASE64: ${AUTH_SIGNING_PRIVATE_KEY_BASE64:?Load production key from secret manager}
+      AUTH_SIGNING_PUBLIC_KEY_BASE64: ${AUTH_SIGNING_PUBLIC_KEY_BASE64:?Load production key from secret manager}
+      AUTH_SIGNING_KEY_ID: ${AUTH_SIGNING_KEY_ID:?Set active production key ID}
+      AUTH_SIGNING_PREVIOUS_PUBLIC_KEYS: ${AUTH_SIGNING_PREVIOUS_PUBLIC_KEYS:-}
+      DB_URL: ${IDENTITY_DB_URL:?Set private TLS Identity DB URL}
+      DB_USERNAME: ${IDENTITY_DB_USERNAME:?Set Identity DB username}
+      DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?Load Identity DB password from secret manager}
+      RABBITMQ_USERNAME: ${IDENTITY_RABBITMQ_USERNAME:?Set Identity RabbitMQ user}
+      RABBITMQ_PASSWORD: ${IDENTITY_RABBITMQ_PASSWORD:?Load Identity RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [identity-keystore]
+    depends_on: !override []
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8443/actuator/health"]
+
+  agent-management-service:
+    image: ${AGENT_MANAGEMENT_IMAGE:?Set immutable Agent Management image}
+    environment:
+      <<: *prod-service-env
+      AGENT_DB_URL: ${AGENT_DB_URL:?Set private TLS Agent Management DB URL}
+      AGENT_DB_USERNAME: ${AGENT_DB_USERNAME:?Set Agent Management DB username}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?Load Agent Management DB password from secret manager}
+      SERVER_SSL_KEY_STORE: file:/run/secrets/agent-management-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${AGENT_MANAGEMENT_TLS_KEYSTORE_PASSWORD:?Set Agent Management TLS secret}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      AGENT_MANAGEMENT_AUDIENCE: agentshield-api,agentshield-agent-management-api
+      AGENT_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${AGENT_RABBITMQ_USERNAME:?Set Agent Management RabbitMQ user}
+      RABBITMQ_PASSWORD: ${AGENT_RABBITMQ_PASSWORD:?Load Agent Management RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [agent-management-keystore]
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8082/actuator/health"]
+
+  policy-engine:
+    image: ${POLICY_ENGINE_IMAGE:?Set immutable Policy Engine image}
+    environment:
+      <<: *prod-service-env
+      POLICY_DB_URL: ${POLICY_DB_URL:?Set private TLS Policy Engine DB URL}
+      POLICY_DB_USERNAME: ${POLICY_DB_USERNAME:?Set Policy Engine DB username}
+      POLICY_DB_PASSWORD: ${POLICY_DB_PASSWORD:?Load Policy Engine DB password from secret manager}
+      SERVER_SSL_KEY_STORE: file:/run/secrets/policy-engine-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${POLICY_ENGINE_TLS_KEYSTORE_PASSWORD:?Set Policy Engine TLS secret}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      POLICY_ENGINE_ALLOWED_AUDIENCES: agentshield-api,policy-engine-api
+      POLICY_ENGINE_AUDIENCE: policy-engine-api
+      POLICY_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${POLICY_RABBITMQ_USERNAME:?Set Policy Engine RabbitMQ user}
+      RABBITMQ_PASSWORD: ${POLICY_RABBITMQ_PASSWORD:?Load Policy Engine RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [policy-engine-keystore]
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8083/actuator/health"]
+
+  ai-analysis-service:
+    image: ${AI_ANALYSIS_IMAGE:?Set immutable AI Analysis image}
+    environment:
+      <<: *prod-service-env
+      AI_ANALYSIS_DB_URL: ${AI_ANALYSIS_DB_URL:?Set private TLS AI Analysis DB URL}
+      AI_ANALYSIS_DB_USERNAME: ${AI_ANALYSIS_DB_USERNAME:?Set AI Analysis DB username}
+      AI_ANALYSIS_DB_PASSWORD: ${AI_ANALYSIS_DB_PASSWORD:?Load AI Analysis DB password from secret manager}
+      SERVER_SSL_KEY_STORE: file:/run/secrets/ai-analysis-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${AI_ANALYSIS_TLS_KEYSTORE_PASSWORD:?Set AI Analysis TLS secret}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      AI_ANALYSIS_ALLOWED_AUDIENCES: agentshield-api
+      AI_ANALYSIS_GATEWAY_AUDIENCE: ai-analysis-api
+      AGENT_MANAGEMENT_SERVICE_URL: https://agent-management-service:8082
+      AI_ANALYSIS_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      AI_LLM_ENABLED: "false"
+      AI_LLM_PROVIDER: none
+      OPENAI_API_KEY: ""
+      RABBITMQ_USERNAME: ${AI_ANALYSIS_RABBITMQ_USERNAME:?Set AI Analysis RabbitMQ user}
+      RABBITMQ_PASSWORD: ${AI_ANALYSIS_RABBITMQ_PASSWORD:?Load AI Analysis RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [ai-analysis-keystore]
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8085/actuator/health"]
+
+  runtime-security-gateway:
+    image: ${RUNTIME_SECURITY_GATEWAY_IMAGE:?Set immutable Runtime Gateway image}
+    environment:
+      <<: *prod-service-env
+      RUNTIME_DB_URL: ${RUNTIME_DB_URL:?Set private TLS Runtime DB URL}
+      RUNTIME_DB_USERNAME: ${RUNTIME_DB_USERNAME:?Set Runtime DB username}
+      RUNTIME_DB_PASSWORD: ${RUNTIME_DB_PASSWORD:?Load Runtime DB password from secret manager}
+      SERVER_SSL_KEY_STORE: file:/run/secrets/runtime-gateway-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${RUNTIME_GATEWAY_TLS_KEYSTORE_PASSWORD:?Set Runtime Gateway TLS secret}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      IDENTITY_TOKEN_URI: https://identity-service:8443/oauth2/token
+      AGENT_MANAGEMENT_BASE_URL: https://agent-management-service:8082
+      POLICY_ENGINE_BASE_URL: https://policy-engine:8083
+      AI_ANALYSIS_BASE_URL: https://ai-analysis-service:8085
+      RUNTIME_TOOL_DESTINATIONS: ${RUNTIME_TOOL_DESTINATIONS:?Set approved production tool destinations}
+      RABBITMQ_USERNAME: ${RUNTIME_RABBITMQ_USERNAME:?Set Runtime Gateway RabbitMQ user}
+      RABBITMQ_PASSWORD: ${RUNTIME_RABBITMQ_PASSWORD:?Load Runtime Gateway RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [runtime-gateway-keystore]
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+      agent-management-service: { condition: service_healthy }
+      policy-engine: { condition: service_healthy }
+      ai-analysis-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8084/actuator/health"]
+
+  audit-service:
+    image: ${AUDIT_SERVICE_IMAGE:?Set immutable Audit image}
+    environment:
+      <<: *prod-service-env
+      AUDIT_DB_URL: ${AUDIT_DB_URL:?Set private TLS Audit DB URL}
+      AUDIT_DB_USERNAME: ${AUDIT_DB_USERNAME:?Set Audit DB username}
+      AUDIT_DB_PASSWORD: ${AUDIT_DB_PASSWORD:?Load Audit DB password from secret manager}
+      SERVER_SSL_KEY_STORE: file:/run/secrets/audit-service-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${AUDIT_SERVICE_TLS_KEYSTORE_PASSWORD:?Set Audit TLS secret}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      AUDIT_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${AUDIT_RABBITMQ_USERNAME:?Set Audit RabbitMQ user}
+      RABBITMQ_PASSWORD: ${AUDIT_RABBITMQ_PASSWORD:?Load Audit RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [audit-service-keystore]
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8086/actuator/health"]
+
+  notification-service:
+    image: ${NOTIFICATION_SERVICE_IMAGE:?Set immutable Notification image}
+    environment:
+      <<: *prod-service-env
+      NOTIFICATION_DB_URL: ${NOTIFICATION_DB_URL:?Set private TLS Notification DB URL}
+      NOTIFICATION_DB_USERNAME: ${NOTIFICATION_DB_USERNAME:?Set Notification DB username}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?Load Notification DB password from secret manager}
+      SERVER_SSL_KEY_STORE: file:/run/secrets/notification-service-keystore.p12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${NOTIFICATION_SERVICE_TLS_KEYSTORE_PASSWORD:?Set Notification TLS secret}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      NOTIFICATION_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      RABBITMQ_USERNAME: ${NOTIFICATION_RABBITMQ_USERNAME:?Set Notification RabbitMQ user}
+      RABBITMQ_PASSWORD: ${NOTIFICATION_RABBITMQ_PASSWORD:?Load Notification RabbitMQ password from secret manager}
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    secrets: [notification-service-keystore]
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agentshield/internal-ca.crt https://localhost:8087/actuator/health"]
+
+  api-gateway:
+    image: ${API_GATEWAY_IMAGE:?Set immutable API Gateway image}
+    environment:
+      SPRING_PROFILES_ACTIVE: production
+      PUBLIC_GATEWAY_URL: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_ISSUER: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      GATEWAY_CORS_ALLOWED_ORIGINS: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      GATEWAY_ORGANIZATION_ONBOARDING_ENABLED: "false"
+    ports: !override []
+    volumes: !override
+      - *prod-truststore-volume
+      - *prod-ca-volume
+    depends_on: !override
+      identity-service: { condition: service_healthy }
+      agent-management-service: { condition: service_healthy }
+      policy-engine: { condition: service_healthy }
+      ai-analysis-service: { condition: service_healthy }
+      runtime-security-gateway: { condition: service_healthy }
+      audit-service: { condition: service_healthy }
+      notification-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8080/actuator/health"]
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?Set immutable frontend image}
+    build:
+      args:
+        VITE_API_BASE_URL: ""
+        VITE_AUTH_CLIENT_ID: agentshield-react-spa
+        VITE_AUTH_REDIRECT_URI: https://${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}/auth/callback
+    ports: !override []
+    depends_on: !override
+      api-gateway: { condition: service_healthy }
+
+  edge:
+    image: ${CADDY_IMAGE:?Set a pinned Caddy image}
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?Set PUBLIC_DOMAIN}
+      CADDY_EMAIL: ${CADDY_EMAIL:?Set CADDY_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile.production:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      frontend: { condition: service_healthy }
+      api-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [agentshield]
+
+networks:
+  agentshield:
+    driver: bridge
+
+secrets:
+  identity-keystore:
+    file: ${IDENTITY_TLS_KEYSTORE_FILE:?Set identity TLS keystore file}
+  agent-management-keystore:
+    file: ${AGENT_MANAGEMENT_TLS_KEYSTORE_FILE:?Set Agent Management TLS keystore file}
+  policy-engine-keystore:
+    file: ${POLICY_ENGINE_TLS_KEYSTORE_FILE:?Set Policy Engine TLS keystore file}
+  ai-analysis-keystore:
+    file: ${AI_ANALYSIS_TLS_KEYSTORE_FILE:?Set AI Analysis TLS keystore file}
+  runtime-gateway-keystore:
+    file: ${RUNTIME_GATEWAY_TLS_KEYSTORE_FILE:?Set Runtime Gateway TLS keystore file}
+  audit-service-keystore:
+    file: ${AUDIT_SERVICE_TLS_KEYSTORE_FILE:?Set Audit TLS keystore file}
+  notification-service-keystore:
+    file: ${NOTIFICATION_SERVICE_TLS_KEYSTORE_FILE:?Set Notification TLS keystore file}
+
+volumes:
+  caddy-data:
+  caddy-config:

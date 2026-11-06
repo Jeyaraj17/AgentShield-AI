@@ -1,0 +1,489 @@
+x-backend-build: &backend-build
+  context: ../..
+  dockerfile: backend/Dockerfile
+
+x-backend-environment: &backend-environment
+  SPRING_PROFILES_ACTIVE: local
+  SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+  RABBITMQ_ADDRESSES: rabbitmq:5672
+  RABBITMQ_USERNAME: ${RABBITMQ_USERNAME:?Set RABBITMQ_USERNAME in .env}
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+  RABBITMQ_VIRTUAL_HOST: /
+  DEV_TLS_TRUSTSTORE_PASSWORD: ${DEV_TLS_TRUSTSTORE_PASSWORD:?Set DEV_TLS_TRUSTSTORE_PASSWORD in .env}
+
+services:
+  tls-init:
+    image: eclipse-temurin:21-jre-jammy
+    restart: "no"
+    entrypoint: ["/bin/sh", "/scripts/generate-identity-tls.sh"]
+    environment:
+      DEV_TLS_KEYSTORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      DEV_TLS_TRUSTSTORE_PASSWORD: ${DEV_TLS_TRUSTSTORE_PASSWORD:?Set DEV_TLS_TRUSTSTORE_PASSWORD in .env}
+    volumes:
+      - identity-tls-key:/keys
+      - agent-management-tls-key:/agent-keys
+      - policy-engine-tls-key:/policy-keys
+      - ai-analysis-tls-key:/ai-keys
+      - runtime-gateway-tls-key:/runtime-keys
+      - audit-service-tls-key:/audit-keys
+      - notification-service-tls-key:/notification-keys
+      - mock-tool-tls-key:/mock-keys
+      - identity-tls-trust:/trust
+      - ./generate-identity-tls.sh:/scripts/generate-identity-tls.sh:ro
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      IDENTITY_DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?Set IDENTITY_DB_PASSWORD in .env}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?Set AGENT_DB_PASSWORD in .env}
+      POLICY_DB_PASSWORD: ${POLICY_DB_PASSWORD:?Set POLICY_DB_PASSWORD in .env}
+      AI_ANALYSIS_DB_PASSWORD: ${AI_ANALYSIS_DB_PASSWORD:?Set AI_ANALYSIS_DB_PASSWORD in .env}
+      RUNTIME_DB_PASSWORD: ${RUNTIME_DB_PASSWORD:?Set RUNTIME_DB_PASSWORD in .env}
+      AUDIT_DB_PASSWORD: ${AUDIT_DB_PASSWORD:?Set AUDIT_DB_PASSWORD in .env}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?Set NOTIFICATION_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${MYSQL_HOST_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./init-service-databases.sh:/docker-entrypoint-initdb.d/10-service-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --user=root --password=\"$${MYSQL_ROOT_PASSWORD}\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [agentshield]
+    mem_limit: 1g
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USERNAME:?Set RABBITMQ_USERNAME in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [agentshield]
+    mem_limit: 512m
+
+  mock-protected-tool:
+    build:
+      context: ./mock-tool
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DEV_TLS_KEYSTORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+    volumes:
+      - mock-tool-tls-key:/run/mock-tool-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/mock-tool-tls/mock-protected-tool.crt https://localhost:8443/health"]
+      interval: 10s
+      timeout: 4s
+      retries: 8
+      start_period: 15s
+    networks: [agentshield]
+    mem_limit: 128m
+
+  identity-service:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: identity-service }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8443
+      SERVER_SERVLET_SESSION_COOKIE_SECURE: "false"
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/identity-tls/identity.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-identity
+      DB_URL: jdbc:mysql://mysql:3306/agentshield_identity?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: agentshield_identity
+      DB_PASSWORD: ${IDENTITY_DB_PASSWORD:?Set IDENTITY_DB_PASSWORD in .env}
+      AUTH_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      AUTH_AUDIENCE: agentshield-api
+      AUTH_SPA_CLIENT_ID: ${AUTH_SPA_CLIENT_ID:-agentshield-react-spa}
+      AUTH_SPA_REDIRECT_URI: ${PUBLIC_AUTH_REDIRECT_URI:-http://localhost:3000/auth/callback}
+      AUTH_SIGNING_PRIVATE_KEY_BASE64: ${AUTH_SIGNING_PRIVATE_KEY_BASE64:?Generate and set AUTH_SIGNING_PRIVATE_KEY_BASE64 in .env}
+      AUTH_SIGNING_PUBLIC_KEY_BASE64: ${AUTH_SIGNING_PUBLIC_KEY_BASE64:?Generate and set AUTH_SIGNING_PUBLIC_KEY_BASE64 in .env}
+      AUTH_SIGNING_KEY_ID: ${AUTH_SIGNING_KEY_ID:-agentshield-local-rsa-1}
+      AGENTSHIELD_SECURITY_JWT_GENERATE_EPHEMERAL_KEY: "false"
+      IDENTITY_ONBOARDING_ENABLED: "true"
+      AUTH_CORS_ALLOWED_ORIGINS: ""
+      AGENT_MANAGEMENT_BASE_URL: https://agent-management-service:8082
+      RUNTIME_GATEWAY_CLIENT_ID: agentshield-runtime-gateway
+      RUNTIME_GATEWAY_CLIENT_SECRET: ${RUNTIME_GATEWAY_CLIENT_SECRET:?Set RUNTIME_GATEWAY_CLIENT_SECRET in .env}
+      RUNTIME_GATEWAY_PREVIOUS_CLIENT_SECRET: ${RUNTIME_GATEWAY_PREVIOUS_CLIENT_SECRET:-}
+      RUNTIME_GATEWAY_ANALYSIS_CLIENT_ID: agentshield-runtime-gateway-analysis
+      RUNTIME_GATEWAY_ANALYSIS_CLIENT_SECRET: ${RUNTIME_GATEWAY_ANALYSIS_CLIENT_SECRET:?Set RUNTIME_GATEWAY_ANALYSIS_CLIENT_SECRET in .env}
+      RUNTIME_GATEWAY_ANALYSIS_PREVIOUS_CLIENT_SECRET: ${RUNTIME_GATEWAY_ANALYSIS_PREVIOUS_CLIENT_SECRET:-}
+      AI_ANALYSIS_AUDIENCE: ai-analysis-api
+      AGENT_TOKEN_AUDIENCE: agentshield-runtime-api
+      AGENT_MANAGEMENT_SERVICE_AUDIENCE: agentshield-agent-management-api
+      POLICY_ENGINE_AUDIENCE: policy-engine-api
+    volumes:
+      - identity-tls-key:/run/identity-tls:ro
+      - identity-tls-trust:/run/agentshield:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/identity-tls/identity.crt https://127.0.0.1:8443/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 90s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  agent-management-service:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: agent-management-service }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8082
+      AGENT_DB_URL: jdbc:mysql://mysql:3306/agent_management?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      AGENT_DB_USERNAME: agent_management
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?Set AGENT_DB_PASSWORD in .env}
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/agent-management-tls/agent-management.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-agent-management
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      AGENT_MANAGEMENT_AUDIENCE: agentshield-api,agentshield-agent-management-api
+      RUNTIME_GATEWAY_CLIENT_ID: agentshield-runtime-gateway
+      AGENT_CORS_ALLOWED_ORIGINS: ""
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+      - agent-management-tls-key:/run/agent-management-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/agent-management-tls/agent-management.crt https://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 75s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  policy-engine:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: policy-engine }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8083
+      POLICY_DB_URL: jdbc:mysql://mysql:3306/policy_engine?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      POLICY_DB_USERNAME: policy_engine
+      POLICY_DB_PASSWORD: ${POLICY_DB_PASSWORD:?Set POLICY_DB_PASSWORD in .env}
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/policy-engine-tls/policy-engine.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-policy-engine
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      POLICY_ENGINE_ALLOWED_AUDIENCES: agentshield-api,policy-engine-api
+      POLICY_ENGINE_AUDIENCE: policy-engine-api
+      AGENT_TOKEN_AUDIENCE: agentshield-runtime-api
+      RUNTIME_GATEWAY_CLIENT_ID: agentshield-runtime-gateway
+      POLICY_CORS_ALLOWED_ORIGINS: ""
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+      - policy-engine-tls-key:/run/policy-engine-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/policy-engine-tls/policy-engine.crt https://localhost:8083/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 75s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  ai-analysis-service:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: ai-analysis-service }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8085
+      AI_ANALYSIS_DB_URL: jdbc:mysql://mysql:3306/ai_analysis?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      AI_ANALYSIS_DB_USERNAME: ai_analysis
+      AI_ANALYSIS_DB_PASSWORD: ${AI_ANALYSIS_DB_PASSWORD:?Set AI_ANALYSIS_DB_PASSWORD in .env}
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/ai-analysis-tls/ai-analysis.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-ai-analysis
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      AI_ANALYSIS_ALLOWED_AUDIENCES: agentshield-api
+      AI_ANALYSIS_GATEWAY_AUDIENCE: ai-analysis-api
+      AGENT_TOKEN_AUDIENCE: agentshield-runtime-api
+      RUNTIME_GATEWAY_ANALYSIS_CLIENT_ID: agentshield-runtime-gateway-analysis
+      AI_LLM_ENABLED: ${AI_LLM_ENABLED:-false}
+      AI_LLM_PROVIDER: ${AI_LLM_PROVIDER:-none}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AI_ANALYSIS_CORS_ALLOWED_ORIGINS: ""
+      AGENT_MANAGEMENT_SERVICE_URL: https://agent-management-service:8082
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+      - ai-analysis-tls-key:/run/ai-analysis-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/ai-analysis-tls/ai-analysis.crt https://localhost:8085/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 75s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  runtime-security-gateway:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: runtime-security-gateway }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8084
+      RUNTIME_DB_URL: jdbc:mysql://mysql:3306/runtime_security_gateway?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      RUNTIME_DB_USERNAME: runtime_security_gateway
+      RUNTIME_DB_PASSWORD: ${RUNTIME_DB_PASSWORD:?Set RUNTIME_DB_PASSWORD in .env}
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/runtime-gateway-tls/runtime-gateway.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-runtime-gateway
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      RUNTIME_SECURITY_GATEWAY_AUDIENCE: agentshield-runtime-api
+      IDENTITY_TOKEN_URI: https://identity-service:8443/oauth2/token
+      RUNTIME_GATEWAY_CLIENT_ID: agentshield-runtime-gateway
+      RUNTIME_GATEWAY_CLIENT_SECRET: ${RUNTIME_GATEWAY_CLIENT_SECRET:?Set RUNTIME_GATEWAY_CLIENT_SECRET in .env}
+      RUNTIME_GATEWAY_ANALYSIS_CLIENT_ID: agentshield-runtime-gateway-analysis
+      RUNTIME_GATEWAY_ANALYSIS_CLIENT_SECRET: ${RUNTIME_GATEWAY_ANALYSIS_CLIENT_SECRET:?Set RUNTIME_GATEWAY_ANALYSIS_CLIENT_SECRET in .env}
+      AGENT_MANAGEMENT_BASE_URL: https://agent-management-service:8082
+      POLICY_ENGINE_BASE_URL: https://policy-engine:8083
+      AI_ANALYSIS_BASE_URL: https://ai-analysis-service:8085
+      RUNTIME_TOOL_DESTINATIONS: ${RUNTIME_TOOL_DESTINATIONS:-mock.echo=https://mock-protected-tool:8443/execute}
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+      - runtime-gateway-tls-key:/run/runtime-gateway-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+      agent-management-service: { condition: service_healthy }
+      policy-engine: { condition: service_healthy }
+      ai-analysis-service: { condition: service_healthy }
+      mock-protected-tool: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/runtime-gateway-tls/runtime-gateway.crt https://localhost:8084/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 75s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  audit-service:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: audit-service }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8086
+      AUDIT_DB_URL: jdbc:mysql://mysql:3306/audit_service?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      AUDIT_DB_USERNAME: audit_service
+      AUDIT_DB_PASSWORD: ${AUDIT_DB_PASSWORD:?Set AUDIT_DB_PASSWORD in .env}
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/audit-service-tls/audit-service.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-audit-service
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      AUDIT_SERVICE_AUDIENCE: agentshield-api,audit-service-api
+      AUDIT_CORS_ALLOWED_ORIGINS: ""
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+      - audit-service-tls-key:/run/audit-service-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/audit-service-tls/audit-service.crt https://localhost:8086/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 75s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  notification-service:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: notification-service }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8087
+      NOTIFICATION_DB_URL: jdbc:mysql://mysql:3306/notification_service?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      NOTIFICATION_DB_USERNAME: notification_service
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD:?Set NOTIFICATION_DB_PASSWORD in .env}
+      SERVER_SSL_ENABLED: "true"
+      SERVER_SSL_KEY_STORE: file:/run/notification-service-tls/notification-service.p12
+      SERVER_SSL_KEY_STORE_TYPE: PKCS12
+      SERVER_SSL_KEY_STORE_PASSWORD: ${DEV_TLS_KEYSTORE_PASSWORD:?Set DEV_TLS_KEYSTORE_PASSWORD in .env}
+      SERVER_SSL_KEY_ALIAS: agentshield-notification-service
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      NOTIFICATION_SERVICE_AUDIENCE: agentshield-api,notification-service-api
+      NOTIFICATION_CORS_ALLOWED_ORIGINS: ""
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+      - notification-service-tls-key:/run/notification-service-tls:ro
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      identity-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --cacert /run/notification-service-tls/notification-service.crt https://localhost:8087/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 75s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  api-gateway:
+    build:
+      <<: *backend-build
+      args: { SERVICE_MODULE: api-gateway }
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *backend-environment
+      SERVER_PORT: 8080
+      IDENTITY_SERVICE_URL: https://identity-service:8443
+      AGENT_MANAGEMENT_SERVICE_URL: https://agent-management-service:8082
+      POLICY_ENGINE_SERVICE_URL: https://policy-engine:8083
+      RUNTIME_SECURITY_GATEWAY_SERVICE_URL: https://runtime-security-gateway:8084
+      AI_ANALYSIS_SERVICE_URL: https://ai-analysis-service:8085
+      AUDIT_SERVICE_URL: https://audit-service:8086
+      NOTIFICATION_SERVICE_URL: https://notification-service:8087
+      PUBLIC_GATEWAY_URL: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_ISSUER: ${PUBLIC_GATEWAY_URL:-http://localhost:8080}
+      IDENTITY_JWKS_URI: https://identity-service:8443/oauth2/jwks
+      API_GATEWAY_AUDIENCE: agentshield-api
+      API_GATEWAY_AGENT_AUDIENCE: agentshield-runtime-api
+      GATEWAY_CORS_ALLOWED_ORIGINS: ${GATEWAY_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      GATEWAY_ORGANIZATION_ONBOARDING_ENABLED: "true"
+    volumes:
+      - identity-tls-trust:/run/agentshield:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      tls-init: { condition: service_completed_successfully }
+      identity-service: { condition: service_healthy }
+      agent-management-service: { condition: service_healthy }
+      policy-engine: { condition: service_healthy }
+      ai-analysis-service: { condition: service_healthy }
+      runtime-security-gateway: { condition: service_healthy }
+      audit-service: { condition: service_healthy }
+      notification-service: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8080/actuator/health"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 90s
+    networks: [agentshield]
+    mem_limit: 768m
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${PUBLIC_FRONTEND_API_BASE_URL:-}
+        VITE_AUTH_CLIENT_ID: ${AUTH_SPA_CLIENT_ID:-agentshield-react-spa}
+        VITE_AUTH_REDIRECT_URI: ${PUBLIC_AUTH_REDIRECT_URI:-http://localhost:3000/auth/callback}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      api-gateway: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [agentshield]
+    mem_limit: 128m
+
+networks:
+  agentshield:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  rabbitmq-data:
+  identity-tls-key:
+  agent-management-tls-key:
+  policy-engine-tls-key:
+  ai-analysis-tls-key:
+  runtime-gateway-tls-key:
+  audit-service-tls-key:
+  notification-service-tls-key:
+  mock-tool-tls-key:
+  identity-tls-trust:
